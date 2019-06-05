@@ -15,7 +15,7 @@ from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 from pytorch_pretrained_bert.modeling import (CONFIG_NAME, WEIGHTS_NAME,
                                               BertConfig,
                                               BertForTokenClassification)
-from pytorch_pretrained_bert.optimization import BertAdam, warmup_linear
+from pytorch_pretrained_bert.optimization import BertAdam, WarmupLinearSchedule
 from pytorch_pretrained_bert.tokenization import BertTokenizer
 from seqeval.metrics import classification_report
 from torch import nn
@@ -24,24 +24,27 @@ from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
+from allennlp.data.dataset_readers.dataset_utils.ontonotes import Ontonotes
 
-logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-                    datefmt = '%m/%d/%Y %H:%M:%S',
-                    level = logging.INFO)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+                    datefmt='%m/%d/%Y %H:%M:%S',
+                    level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 class Ner(BertForTokenClassification):
 
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,valid_ids=None,attention_mask_label=None):
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None, valid_ids=None,
+                attention_mask_label=None):
         sequence_output, _ = self.bert(input_ids, token_type_ids, attention_mask, output_all_encoded_layers=False)
-        batch_size,max_len,feat_dim = sequence_output.shape
-        valid_output = torch.zeros(batch_size,max_len,feat_dim,dtype=torch.float32,device='cuda')
+        batch_size, max_len, feat_dim = sequence_output.shape
+        valid_output = torch.zeros(batch_size, max_len, feat_dim, dtype=torch.float32, device='cuda')
         for i in range(batch_size):
             jj = -1
             for j in range(max_len):
-                    if valid_ids[i][j].item() == 1:
-                        jj += 1
-                        valid_output[i][jj] = sequence_output[i][j]
+                if valid_ids[i][j].item() == 1:
+                    jj += 1
+                    valid_output[i][jj] = sequence_output[i][j]
         sequence_output = self.dropout(valid_output)
         logits = self.classifier(sequence_output)
 
@@ -81,6 +84,7 @@ class InputExample(object):
         self.text_b = text_b
         self.label = label
 
+
 class InputFeatures(object):
     """A single set of features of data."""
 
@@ -92,32 +96,34 @@ class InputFeatures(object):
         self.valid_ids = valid_ids
         self.label_mask = label_mask
 
-def readfile(filename):
-    '''
-    read file
-    return format :
-    [ ['EU', 'B-ORG'], ['rejects', 'O'], ['German', 'B-MISC'], ['call', 'O'], ['to', 'O'], ['boycott', 'O'], ['British', 'B-MISC'], ['lamb', 'O'], ['.', 'O'] ]
-    '''
-    f = open(filename)
-    data = []
-    sentence = []
-    label= []
-    for line in f:
-        if len(line)==0 or line.startswith('-DOCSTART') or line[0]=="\n":
-            if len(sentence) > 0:
-                data.append((sentence,label))
-                sentence = []
-                label = []
-            continue
-        splits = line.split(' ')
-        sentence.append(splits[0])
-        label.append(splits[-1][:-1])
 
-    if len(sentence) >0:
-        data.append((sentence,label))
-        sentence = []
-        label = []
-    return data
+# def readfile(filename):
+#     '''
+#     read file
+#     return format :
+#     [ ['EU', 'B-ORG'], ['rejects', 'O'], ['German', 'B-MISC'], ['call', 'O'], ['to', 'O'], ['boycott', 'O'], ['British', 'B-MISC'], ['lamb', 'O'], ['.', 'O'] ]
+#     '''
+#     f = open(filename)
+#     data = []
+#     sentence = []
+#     label = []
+#     for line in f:
+#         if len(line) == 0 or line.startswith('-DOCSTART') or line[0] == "\n":
+#             if len(sentence) > 0:
+#                 data.append((sentence, label))
+#                 sentence = []
+#                 label = []
+#             continue
+#         splits = line.split(' ')
+#         sentence.append(splits[0])
+#         label.append(splits[-1][:-1])
+#
+#     if len(sentence) > 0:
+#         data.append((sentence, label))
+#         sentence = []
+#         label = []
+#     return data
+
 
 class DataProcessor(object):
     """Base class for data converters for sequence classification data sets."""
@@ -134,52 +140,81 @@ class DataProcessor(object):
         """Gets the list of labels for this data set."""
         raise NotImplementedError()
 
-    @classmethod
-    def _read_tsv(cls, input_file, quotechar=None):
-        """Reads a tab separated value file."""
-        return readfile(input_file)
+    # @classmethod
+    # def _read_tsv(cls, input_file, quotechar=None):
+    #     """Reads a tab separated value file."""
+    #     return readfile(input_file)
+
+
+class OntoNotesIter(object):
+
+    def __init__(self, data_dir) -> None:
+        super().__init__()
+        self.data_dir = data_dir
+        self.data_reader = Ontonotes()
+        self.data_iter = self.data_reader.dataset_iterator(self.data_dir)
+
+    def __iter__(self):
+        self.data_iter = self.data_reader.dataset_iterator(self.data_dir)
+        return self
+
+    def __next__(self):
+        sentence = next(self.data_iter)
+        return sentence.words, sentence.named_entities
 
 
 class NerProcessor(DataProcessor):
     """Processor for the CoNLL-2003 data set."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.labels = set()
+
     def get_train_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.txt")), "train")
+        lines_iter = OntoNotesIter(os.path.join(data_dir, "development"))
+        return self._create_examples(lines_iter, "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "valid.txt")), "dev")
+        lines_iter = OntoNotesIter(os.path.join(data_dir, "development"))
+        return self._create_examples(lines_iter, "dev")
 
     def get_test_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "test.txt")), "test")
+        lines_iter = OntoNotesIter(os.path.join(data_dir, "test"))
+        return self._create_examples(lines_iter, "test")
 
     def get_labels(self):
-        return ["O", "B-MISC", "I-MISC",  "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC"]
+        return ['O', 'I-GPE', 'B-DATE', 'B-LAW', 'B-NORP', 'B-QUANTITY', 'I-PERSON', 'I-EVENT', 'I-LAW', 'I-FAC',
+                'B-LOC', 'I-DATE', 'I-ORDINAL', 'B-ORG', 'B-WORK_OF_ART', 'I-CARDINAL', 'B-PERCENT', 'B-ORDINAL',
+                'I-NORP', 'B-GPE', 'B-PRODUCT', 'I-MONEY', 'B-LANGUAGE', 'I-PRODUCT', 'B-MONEY', 'I-LANGUAGE',
+                'B-EVENT', 'B-FAC', 'B-CARDINAL', 'I-LOC', 'I-TIME', 'I-PERCENT', 'B-PERSON', 'I-QUANTITY', 'B-TIME',
+                'I-WORK_OF_ART', 'I-ORG']
 
-    def _create_examples(self,lines,set_type):
+    def _create_examples(self, lines_iter, set_type):
         examples = []
-        for i,(sentence,label) in enumerate(lines):
-            guid = "%s-%s" % (set_type, i)
-            text_a = ' '.join(sentence)
+        for i, (sentence, label) in enumerate(lines_iter):
+            guid = f"{set_type}-{i}"
+            # text_a = ' '.join(sentence)
+            text_a = sentence
             text_b = None
             label = label
-            examples.append(InputExample(guid=guid,text_a=text_a,text_b=text_b,label=label))
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
         return examples
+
 
 def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer):
     """Loads a data file into a list of `InputBatch`s."""
 
-    label_map = {label : i for i, label in enumerate(label_list,1)}
+    label_map = {label: i for i, label in enumerate(label_list, 1)}
 
     features = []
-    for (ex_index,example) in enumerate(examples):
-        textlist = example.text_a.split(' ')
+    for (ex_index, example) in enumerate(examples):
+        # textlist = example.text_a.split(' ')
+        textlist = example.text_a
         labellist = example.label
+
         tokens = []
         labels = []
         valid = []
@@ -205,8 +240,8 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
         label_ids = []
         ntokens.append("[CLS]")
         segment_ids.append(0)
-        valid.insert(0,1)
-        label_mask.insert(0,1)
+        valid.insert(0, 1)
+        label_mask.insert(0, 1)
         label_ids.append(label_map["O"])
         for i, token in enumerate(tokens):
             ntokens.append(token)
@@ -242,21 +277,22 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
             logger.info("*** Example ***")
             logger.info("guid: %s" % (example.guid))
             logger.info("tokens: %s" % " ".join(
-                    [str(x) for x in tokens]))
+                [str(x) for x in tokens]))
             logger.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
             logger.info("input_mask: %s" % " ".join([str(x) for x in input_mask]))
             logger.info(
-                    "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
+                "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
             # logger.info("label: %s (id = %d)" % (example.label, label_ids))
 
         features.append(
-                InputFeatures(input_ids=input_ids,
-                              input_mask=input_mask,
-                              segment_ids=segment_ids,
-                              label_id=label_ids,
-                              valid_ids=valid,
-                              label_mask=label_mask))
+            InputFeatures(input_ids=input_ids,
+                          input_mask=input_mask,
+                          segment_ids=segment_ids,
+                          label_id=label_ids,
+                          valid_ids=valid,
+                          label_mask=label_mask))
     return features
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -269,8 +305,8 @@ def main():
                         help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
     parser.add_argument("--bert_model", default=None, type=str, required=True,
                         help="Bert pre-trained model selected in the list: bert-base-uncased, "
-                        "bert-large-uncased, bert-base-cased, bert-large-cased, bert-base-multilingual-uncased, "
-                        "bert-base-multilingual-cased, bert-base-chinese.")
+                             "bert-large-uncased, bert-base-cased, bert-large-cased, bert-base-multilingual-uncased, "
+                             "bert-base-multilingual-cased, bert-base-chinese.")
     parser.add_argument("--task_name",
                         default=None,
                         type=str,
@@ -357,7 +393,7 @@ def main():
         ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
         ptvsd.wait_for_attach()
 
-    processors = {"ner":NerProcessor}
+    processors = {"ner": NerProcessor}
 
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
@@ -373,7 +409,7 @@ def main():
 
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
-                            args.gradient_accumulation_steps))
+            args.gradient_accumulation_steps))
 
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
@@ -410,10 +446,11 @@ def main():
             num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
 
     # Prepare model
-    cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed_{}'.format(args.local_rank))
+    cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE),
+                                                                   'distributed_{}'.format(args.local_rank))
     model = Ner.from_pretrained(args.bert_model,
-              cache_dir=cache_dir,
-              num_labels = num_labels)
+                                cache_dir=cache_dir,
+                                num_labels=num_labels)
     if args.fp16:
         model.half()
     model.to(device)
@@ -421,44 +458,49 @@ def main():
         try:
             from apex.parallel import DistributedDataParallel as DDP
         except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
+            raise ImportError(
+                "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
 
         model = DDP(model)
     elif n_gpu > 1:
         model = torch.nn.DataParallel(model)
 
-    param_optimizer = list(model.named_parameters())
-    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-    optimizer_grouped_parameters = [
-        {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
-        {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+    # Prepare optimizer
+    if args.do_train:
+        param_optimizer = list(model.named_parameters())
+        no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
+            {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
         ]
-    if args.fp16:
-        try:
-            from apex.optimizers import FP16_Optimizer
-            from apex.optimizers import FusedAdam
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
+        if args.fp16:
+            try:
+                from apex.optimizers import FP16_Optimizer
+                from apex.optimizers import FusedAdam
+            except ImportError:
+                raise ImportError(
+                    "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
 
-        optimizer = FusedAdam(optimizer_grouped_parameters,
-                              lr=args.learning_rate,
-                              bias_correction=False,
-                              max_grad_norm=1.0)
-        if args.loss_scale == 0:
-            optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
+            optimizer = FusedAdam(optimizer_grouped_parameters,
+                                  lr=args.learning_rate,
+                                  bias_correction=False,
+                                  max_grad_norm=1.0)
+            if args.loss_scale == 0:
+                optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
+            else:
+                optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_scale)
+            warmup_linear = WarmupLinearSchedule(warmup=args.warmup_proportion,
+                                                 t_total=num_train_optimization_steps)
         else:
-            optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_scale)
-
-    else:
-        optimizer = BertAdam(optimizer_grouped_parameters,
-                             lr=args.learning_rate,
-                             warmup=args.warmup_proportion,
-                             t_total=num_train_optimization_steps)
+            optimizer = BertAdam(optimizer_grouped_parameters,
+                                 lr=args.learning_rate,
+                                 warmup=args.warmup_proportion,
+                                 t_total=num_train_optimization_steps)
 
     global_step = 0
-    nb_tr_steps = 0
-    tr_loss = 0
-    label_map = {i : label for i, label in enumerate(label_list,1)}
+    # nb_tr_steps = 0
+    # tr_loss = 0
+    # label_map = {i: label for i, label in enumerate(label_list, 1)}
     if args.do_train:
         train_features = convert_examples_to_features(
             train_examples, label_list, args.max_seq_length, tokenizer)
@@ -472,7 +514,8 @@ def main():
         all_label_ids = torch.tensor([f.label_id for f in train_features], dtype=torch.long)
         all_valid_ids = torch.tensor([f.valid_ids for f in train_features], dtype=torch.long)
         all_lmask_ids = torch.tensor([f.label_mask for f in train_features], dtype=torch.long)
-        train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids,all_valid_ids,all_lmask_ids)
+        train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids, all_valid_ids,
+                                   all_lmask_ids)
         if args.local_rank == -1:
             train_sampler = RandomSampler(train_data)
         else:
@@ -485,10 +528,10 @@ def main():
             nb_tr_examples, nb_tr_steps = 0, 0
             for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
                 batch = tuple(t.to(device) for t in batch)
-                input_ids, input_mask, segment_ids, label_ids, valid_ids,l_mask = batch
-                loss = model(input_ids, segment_ids, input_mask, label_ids,valid_ids,l_mask)
+                input_ids, input_mask, segment_ids, label_ids, valid_ids, l_mask = batch
+                loss = model(input_ids, segment_ids, input_mask, label_ids, valid_ids, l_mask)
                 if n_gpu > 1:
-                    loss = loss.mean() # mean() to average on multi-gpu.
+                    loss = loss.mean()  # mean() to average on multi-gpu.
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
 
@@ -504,13 +547,14 @@ def main():
                     if args.fp16:
                         # modify learning rate with special warm up BERT uses
                         # if args.fp16 is False, BertAdam is used that handles this automatically
-                        lr_this_step = args.learning_rate * warmup_linear(global_step/num_train_optimization_steps, args.warmup_proportion)
+                        lr_this_step = args.learning_rate * warmup_linear(global_step / num_train_optimization_steps,
+                                                                          args.warmup_proportion)
                         for param_group in optimizer.param_groups:
                             param_group['lr'] = lr_this_step
                     optimizer.step()
                     optimizer.zero_grad()
                     global_step += 1
-
+                break
         # Save a trained model and the associated configuration
         model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
         output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME)
@@ -518,9 +562,11 @@ def main():
         output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
         with open(output_config_file, 'w') as f:
             f.write(model_to_save.config.to_json_string())
-        label_map = {i : label for i, label in enumerate(label_list,1)}
-        model_config = {"bert_model":args.bert_model,"do_lower":args.do_lower_case,"max_seq_length":args.max_seq_length,"num_labels":len(label_list)+1,"label_map":label_map}
-        json.dump(model_config,open(os.path.join(args.output_dir,"model_config.json"),"w"))
+        label_map = {i: label for i, label in enumerate(label_list, 1)}
+        model_config = {"bert_model": args.bert_model, "do_lower": args.do_lower_case,
+                        "max_seq_length": args.max_seq_length, "num_labels": len(label_list) + 1,
+                        "label_map": label_map}
+        json.dump(model_config, open(os.path.join(args.output_dir, "model_config.json"), "w"))
         # Load a trained model and config that you have fine-tuned
     else:
         output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
@@ -543,17 +589,18 @@ def main():
         all_label_ids = torch.tensor([f.label_id for f in eval_features], dtype=torch.long)
         all_valid_ids = torch.tensor([f.valid_ids for f in eval_features], dtype=torch.long)
         all_lmask_ids = torch.tensor([f.label_mask for f in eval_features], dtype=torch.long)
-        eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids,all_valid_ids,all_lmask_ids)
+        eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids, all_valid_ids,
+                                  all_lmask_ids)
         # Run prediction for full data
         eval_sampler = SequentialSampler(eval_data)
         eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
         model.eval()
-        eval_loss, eval_accuracy = 0, 0
-        nb_eval_steps, nb_eval_examples = 0, 0
+
         y_true = []
         y_pred = []
-        label_map = {i : label for i, label in enumerate(label_list,1)}
-        for input_ids, input_mask, segment_ids, label_ids,valid_ids,l_mask in tqdm(eval_dataloader, desc="Evaluating"):
+        label_map = {i: label for i, label in enumerate(label_list, 1)}
+        for input_ids, input_mask, segment_ids, label_ids, valid_ids, l_mask in tqdm(eval_dataloader,
+                                                                                     desc="Evaluating"):
             input_ids = input_ids.to(device)
             input_mask = input_mask.to(device)
             segment_ids = segment_ids.to(device)
@@ -562,17 +609,17 @@ def main():
             l_mask = l_mask.to(device)
 
             with torch.no_grad():
-                logits = model(input_ids, segment_ids, input_mask,valid_ids=valid_ids,attention_mask_label=l_mask)
+                logits = model(input_ids, segment_ids, input_mask, valid_ids=valid_ids, attention_mask_label=l_mask)
 
-            logits = torch.argmax(F.log_softmax(logits,dim=2),dim=2)
+            logits = torch.argmax(F.log_softmax(logits, dim=2), dim=2)
             logits = logits.detach().cpu().numpy()
-            label_ids = label_ids.to('cpu').numpy()
-            input_mask = input_mask.to('cpu').numpy()
+            label_ids = label_ids.cpu().numpy()
+            input_mask = input_mask.cpu().numpy()
 
             for i, label in enumerate(label_ids):
                 temp_1 = []
                 temp_2 = []
-                for j,m in enumerate(label):
+                for j, m in enumerate(label):
                     if j == 0:
                         continue
                     elif input_mask[i][j] == 0:
@@ -585,7 +632,7 @@ def main():
                         temp_1.append(label_map[label_ids[i][j]])
                         temp_2.append(label_map[logits[i][j]])
 
-        report = classification_report(y_true, y_pred,digits=4)
+        report = classification_report(y_true, y_pred, digits=4)
         logger.info("\n%s", report)
         output_eval_file = os.path.join(args.output_dir, "eval_results.txt")
         with open(output_eval_file, "w") as writer:
